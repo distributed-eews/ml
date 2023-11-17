@@ -1,67 +1,86 @@
 from pathlib import Path
+from typing import Set, List
+
 import numpy as np
 import pipeline_functions
+import redis
+import pickle
+
 
 class Pipeline:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, warmup_duration: int, name: str = "untitled"):
         self._states: dict = {}
         self._pipeline: list = []
+        self._names: Set[str] = set()
         self._path: Path = path
 
-        # Build pipeline
-        self._build_pipeline()
+        self._name = name
+        self._redis_client = redis.Redis(host="localhost", port="6379", db=0)
+
+        self.warmup_duration = warmup_duration
+        self._redis_client.set(self._name + "~warmup_x", pickle.dumps([]))
+        self._redis_client.set(self._name + "~warmup_x_len", 0)
+
+        self._processing_function = self._warmup
+
+    def set_name(self, name: str) -> str:
+        i = 0
+        while True:
+            new_name = f'{self._name}_{name}_{i}'
+            if new_name not in self._names:
+                self._names.add(new_name)
+                break
+            i += 1
+        return new_name
+
+    def get_redis_client(self) -> redis.Redis:
+        return self._redis_client
 
     def reset(self):
-        self._build_pipeline()
+        pass
 
-    def _build_pipeline(self):
+    def _build_pipeline(self, init_x: np.ndarray):
         self._pipeline = []
         with open(self._path) as f:
+            x = init_x
             for line in f:
+                pipeline_function: pipeline_functions.PipelineFunction = eval("pipeline_functions." + line)
+                pipeline_function.set_parent(self)
+                pipeline_function.set_initial_state(x)
+                x = pipeline_function.compute(x)
+                self._pipeline.append(pipeline_function)
 
-                self._pipeline.append(eval("pipeline_functions." + line))
+        return x
 
-    def process(self, x: np.ndarray, metadata: dict):  # Generator state machine
+    def process(self, x: np.ndarray) -> np.ndarray:  # Generator state machine
+        return self._processing_function(x)
+
+    def _process(self, x: np.ndarray) -> np.ndarray:
         for pipeline_function in self._pipeline:
             x = pipeline_function.compute(x)
         return x
 
+    def _warmup(self, x: np.ndarray) -> np.ndarray:
+        # Get the latest warmup x
+        warmup_x: List[bytes] = pickle.loads(self._redis_client.get(self._name + "~warmup_x"))
+        warmup_x_len: int = int(self._redis_client.get(self._name + "~warmup_x_len"))
 
-if __name__ == '__main__':
+        # Update state
+        warmup_x.append(x.dumps())
+        warmup_x_len += len(x)
 
-    print("Initializing test...")
-    # Test reading pipeline success
-    p0 = Pipeline(Path("pipeline/model_p_best.pipeline"))
-    print("Success building pipeline p...")
-    p1 = Pipeline(Path("pipeline/model_s_best.pipeline"))
-    print("Success building pipeline s...")
+        if warmup_x_len >= self.warmup_duration:
+            # Convert all the warmup xs to numpy array
+            warmup_x_np: List[np.ndarray] = [pickle.loads(b) for b in warmup_x]
+            x = np.concatenate(warmup_x_np, axis=0)
+            x = self._build_pipeline(x)
+            self._processing_function = self._process
 
-    # Testing pipeline
-    p = Pipeline(Path("pipeline/test.pipeline"))
-    x = np.array([[1.0, 2.0, 0.0],
-                  [1.0, 0.0, 0.0],
-                  [1.0, 3.0, 0.0],
-                  [1.0, 0.0, 0.0]])
-    metadata = {'f': 20.0}
-    print(f"Initial x:\n{x}\n")
+            return x
 
-    # Generate function
-    convert_to_velocity = p.convert_to_velocity("1")
-    exponential_smoothing = p.exponential_smoothing(0.5, "2")
-    multi_exponential_smoothing = p.multi_exponential_smoothing(np.array([0.0, 0.5, 1.0]), "3")
-    square = p.square("4")
-    add_channels = p.add_channels("5")
-    pairwise_ratio = p.pairwise_ratio(np.array([0.0, 0.5, 1.0]), "6")
-    poly_decay = p.poly_decay(1, 1, "7")
+        # Save state
+        print("Warming Up")
+        self._redis_client.set(self._name + "~warmup_x", pickle.dumps(warmup_x))
+        self._redis_client.set(self._name + "~warmup_x_len", warmup_x_len)
 
-    # test functions
-    print(f"convert_to_velocity:\n{convert_to_velocity(x, metadata)}\n")
-    print(f"exponential_smothing:\n{exponential_smoothing(x, metadata)}\n")
-    print(f"multi_exponential_smoothing:\n{multi_exponential_smoothing(np.array([[1.0] for i in range(100)]), metadata)}\n")
-    print(f"square:\n{square(x, metadata)}\n")
-    print(f"add_channels:\n{add_channels(x, metadata)}\n")
-    print(f"pairwise_ratio:\n{pairwise_ratio(x, metadata)}\n")
-    print(f"poly_decay:\n{poly_decay(np.array([[1.0, 1.0] for i in range(10)]), metadata)}\n")
-
-
-
+        return np.array([np.nan])
