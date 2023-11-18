@@ -159,21 +159,28 @@ class SlidingWindow(PipelineFunction):
         self.normalize_windows: bool = normalize_windows
 
     def compute(self, x: np.ndarray) -> np.ndarray:
-        # Uncut windows
+
+        window_size_longer: bool = self.window_size >= len(x)
         uncut_windows = []
+        cut_windows = []
+
+        # Uncut windows
         for i in range(self.window_size, len(x)):
             uncut_windows.append(x[i-self.window_size:i])
         uncut_windows = np.array(uncut_windows)
 
         # Cut windows
-        cut_windows = []
         prev_window = self.get()
-        for i in range(1, self.window_size):
+        for i in range(1, min(self.window_size, len(x))):
             cut_windows.append(np.concatenate([prev_window[i:], x[:i]]))
         cut_windows = np.array(cut_windows)
 
         # Update last windows
-        windows = np.concatenate([cut_windows, uncut_windows], axis=0)
+        windows: np.ndarray
+        if uncut_windows.any():  # if uncut windows is not empty
+            windows = np.concatenate([cut_windows, uncut_windows], axis=0)
+        else:
+            windows = cut_windows
         self.set(windows[-1])
 
         if self.normalize_windows:
@@ -183,8 +190,6 @@ class SlidingWindow(PipelineFunction):
                 windows_min = np.min(windows_i, axis=0)
 
                 windows[i] = (windows_i - windows_min) / (windows_max - windows_min)
-
-        print("windows_shape ", windows.shape)
 
         return windows
 

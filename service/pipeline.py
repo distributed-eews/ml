@@ -6,6 +6,8 @@ import pipeline_functions
 import redis
 import pickle
 
+import settings
+
 
 class Pipeline:
     def __init__(self, path: Path, warmup_duration: int, name: str = "untitled"):
@@ -15,13 +17,13 @@ class Pipeline:
         self._path: Path = path
 
         self._name = name
-        self._redis_client = redis.Redis(host="localhost", port="6379", db=0)
+        self._redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB_NUM)
 
         self.warmup_duration = warmup_duration
-        self._redis_client.set(self._name + "~warmup_x", pickle.dumps([]))
-        self._redis_client.set(self._name + "~warmup_x_len", 0)
+        self._redis_client.set(self._name + "~init", pickle.dumps([]))
+        self._redis_client.set(self._name + "~init_len", 0)
 
-        self._processing_function = self._warmup
+        self._processing_function = self._init
 
     def set_name(self, name: str) -> str:
         i = 0
@@ -60,27 +62,26 @@ class Pipeline:
             x = pipeline_function.compute(x)
         return x
 
-    def _warmup(self, x: np.ndarray) -> np.ndarray:
+    def _init(self, x: np.ndarray) -> np.ndarray:
         # Get the latest warmup x
-        warmup_x: List[bytes] = pickle.loads(self._redis_client.get(self._name + "~warmup_x"))
-        warmup_x_len: int = int(self._redis_client.get(self._name + "~warmup_x_len"))
+        init: List[bytes] = pickle.loads(self._redis_client.get(self._name + "~init"))
+        init_len: int = int(self._redis_client.get(self._name + "~init_len"))
 
         # Update state
-        warmup_x.append(x.dumps())
-        warmup_x_len += len(x)
+        init.append(x.dumps())
+        init_len += len(x)
 
-        if warmup_x_len >= self.warmup_duration:
+        if init_len >= self.warmup_duration:
             # Convert all the warmup xs to numpy array
-            warmup_x_np: List[np.ndarray] = [pickle.loads(b) for b in warmup_x]
-            x = np.concatenate(warmup_x_np, axis=0)
+            init_np: List[np.ndarray] = [pickle.loads(b) for b in init]
+            x = np.concatenate(init_np, axis=0)
             x = self._build_pipeline(x)
             self._processing_function = self._process
 
             return x
 
         # Save state
-        print("Warming Up")
-        self._redis_client.set(self._name + "~warmup_x", pickle.dumps(warmup_x))
-        self._redis_client.set(self._name + "~warmup_x_len", warmup_x_len)
+        self._redis_client.set(self._name + "~init", pickle.dumps(init))
+        self._redis_client.set(self._name + "~init_len", init_len)
 
         return np.array([np.nan])
