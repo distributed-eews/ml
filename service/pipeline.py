@@ -71,17 +71,24 @@ class Pipeline:
         init.append(x.dumps())
         init_len += len(x)
 
-        if init_len >= self.warmup_duration:
-            # Convert all the warmup xs to numpy array
-            init_np: List[np.ndarray] = [pickle.loads(b) for b in init]
-            x = np.concatenate(init_np, axis=0)
-            x = self._build_pipeline(x)
-            self._processing_function = self._process
+        # Case if not enough data to perform inference
+        if init_len < self.warmup_duration:
+            raise PipelineHasNotBeenInitializedException
 
-            return x
+        # When there are enough data, end initialization state
+        init_np: List[np.ndarray] = [pickle.loads(b) for b in init]
+        x = np.concatenate(init_np, axis=0)
+        x = self._build_pipeline(x)
+        self._processing_function = self._process
+
+        return x
 
         # Save state
         self._redis_client.set(self._name + "~init", pickle.dumps(init))
         self._redis_client.set(self._name + "~init_len", init_len)
 
-        return np.array([np.nan])
+        raise
+
+
+class PipelineHasNotBeenInitializedException(Exception):
+    pass

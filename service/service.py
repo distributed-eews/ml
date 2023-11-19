@@ -15,7 +15,7 @@ from bentoml.io import NumpyNdarray
 from bentoml.io import JSON, Text
 from pydantic import BaseModel
 
-from pipeline import Pipeline
+from pipeline import Pipeline, PipelineHasNotBeenInitializedException
 import settings
 
 BENTO_MODEL_TAG_P = "p_model:latest"
@@ -45,19 +45,20 @@ class InputDataInference(BaseModel):
 
 
 class OutputDataInference(BaseModel):
+    station_code: str
+    init_end: bool
+
     # P wave data
     p_arr: bool
     p_arr_time: str
     p_arr_id: int
     new_p_event: bool
-    p_pred: List[List[float]]
 
     # S wave data
     s_arr: bool
     s_arr_time: str
     s_arr_id: int
     new_s_event: bool
-    s_pred: List[List[float]] | NoneType
 
 
 @wave_arrival_detector.api(input=JSON(pydantic_model=InputDataRegister), output=Text())
@@ -97,7 +98,26 @@ def predict(input_data: json) -> json:
         pipelines[station_code] = pipeline
 
     # Preprocess x
-    x = pipeline.process(x)
+    x: np.ndarray
+    try:
+        x = pipeline.process(x)
+    except PipelineHasNotBeenInitializedException:
+        output = {
+            "station_code": station_code,
+            "init_end": False,
+
+            # P wave data
+            "p_arr": False,
+            "p_arr_time": "",
+            "p_arr_id": "",
+            "new_p_event": False,
+
+            # S wave data
+            "s_arr": False,
+            "s_arr_time": "",
+            "s_arr_id": "",
+            "new_s_event": False,
+        }
 
     # ### P WAVE DETECTION ###
     # Make prediction
@@ -121,7 +141,6 @@ def predict(input_data: json) -> json:
         timer_s = p_arrival_time
         redis_client.set(f"{station_code}~timer_s", p_arrival_time.strftime(settings.DATETIME_FORMAT))
 
-    prediction_s = None
     if timer_s - begin_time <= settings.S_WAVE_DETECTION_DURATION:
         # Make prediction
         prediction_s: np.ndarray = s_detector_runner.predict.run(x)
@@ -132,19 +151,20 @@ def predict(input_data: json) -> json:
 
     # ### SUMMARIZE ###
     output = {
+        "station_code": station_code,
+        "init_end": True,
+
         # P wave data
         "p_arr": p_arrival_detected,
         "p_arr_time": p_arrival_time.strftime(settings.DATETIME_FORMAT),
         "p_arr_id": f"{station_code}~{p_arr_id}",
         "new_p_event": new_p_event,
-        "p_pred": prediction_p.tolist(),
 
         # S wave data
         "s_arr": s_arrival_detected,
         "s_arr_time": s_arrival_time.strftime(settings.DATETIME_FORMAT),
         "s_arr_id": f"{station_code}~{s_arr_id}",
         "new_s_event": new_s_event,
-        "s_pred": None if prediction_s is None else prediction_s.tolist(),
     }
 
     return json.dumps(output)
