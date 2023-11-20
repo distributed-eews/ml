@@ -1,148 +1,94 @@
 from pathlib import Path
+from typing import Set, List
+
 import numpy as np
+import pipeline_functions
+import redis
+import pickle
+
+import settings
+
 
 class Pipeline:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, warmup_duration: int, name: str = "untitled"):
         self._states: dict = {}
         self._pipeline: list = []
+        self._names: Set[str] = set()
         self._path: Path = path
 
-        # Build pipeline
-        self._build_pipeline()
+        self._name = name
+        self._redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_DB_NUM)
 
-    def _build_pipeline(self):
-        self._pipeline = []
-        with open(self._path) as f:
-            for line in f:
-                self._pipeline.append(eval("self." + line))
+        self.warmup_duration = warmup_duration
+        self._redis_client.set(self._name + "~init", pickle.dumps([]))
+        self._redis_client.set(self._name + "~init_len", 0)
+
+        self._processing_function = self._init
+
+    def set_name(self, name: str) -> str:
+        i = 0
+        while True:
+            new_name = f'{self._name}_{name}_{i}'
+            if new_name not in self._names:
+                self._names.add(new_name)
+                break
+            i += 1
+        return new_name
+
+    def get_redis_client(self) -> redis.Redis:
+        return self._redis_client
 
     def reset(self):
-        self._build_pipeline()
+        pass
 
-    def convert_to_velocity(self, name:str ='c2v'):
-        self._states[name] = 0
+    def _build_pipeline(self, init_x: np.ndarray):
+        self._pipeline = []
+        with open(self._path) as f:
+            x = init_x
+            for line in f:
+                pipeline_function: pipeline_functions.PipelineFunction = eval("pipeline_functions." + line)
+                pipeline_function.set_parent(self)
+                pipeline_function.set_initial_state(x)
+                x = pipeline_function.compute(x)
+                self._pipeline.append(pipeline_function)
 
-        def _convert_to_velocity(x: np.ndarray, metadata: dict):
-            velocity = []
-            for val in x:
-                velocity.append((val - self._states[name]) * metadata['f'])
-                self._states[name] = val
-            return np.array(velocity)
-        return _convert_to_velocity
-
-    def exponential_smoothing(self, alpha: np.float32, name: str ='expsmth'):
-        # Cache value
-        alpha_ = 1 - alpha
-        # Set initial statue
-        self._states[name] = 0
-
-        def _exponential_smoothing(x: np.ndarray, metadata: dict):
-            smoothed = []
-            for val in x:
-                old_ema = self._states[name]
-                new_ema = old_ema * alpha + val * alpha_
-                self._states[name] = new_ema
-                smoothed.append(new_ema)
-            return np.array(smoothed)
-        return _exponential_smoothing
-
-    def multi_exponential_smoothing(self, alphas: np.ndarray, name:str ='mul_expsmth'):  # expect 1 dimensional x
-        # Cache values
-        alphas = np.array(alphas)
-        alphas_ = 1 - alphas
-        # Set initial state
-        self._states[name] = np.zeros(len(alphas))
-
-        def _multi_exponential_smoothing(x: np.ndarray, metadata: dict):  # Expected dimension = 1
-            # TODO : Implement this for multichannel
-            emas = []
-            for val in x:
-                old_ema = self._states[name]
-                new_ema = old_ema * alphas + val * alphas_
-                self._states[name] = new_ema
-                emas.append(new_ema.flatten())
-            return np.array(emas)
-        return _multi_exponential_smoothing
-
-    def square(self, name:str ='square'):
-        def _square(x: np.ndarray, metadata: dict):
-            return x*x
-        return _square
-
-    def add_channels(self, name:str ='add_channels'):
-        def _add_channels(x: np.ndarray, metadata: dict):
-            return np.sum(x, axis=-1, keepdims=True)
-        return _add_channels
-
-    def pairwise_ratio(self, alpha: np.ndarray, name:str ='pairwise_ratio'):
-        alpha = np.array(alpha)
-        # Generate Order
-        idx_area = [(i, -np.log(1 - a) * (a) / (1 - a)) for i, a in enumerate(alpha)]
-        triplets = [(j, i, idx_area[i][1] / idx_area[j][1]) for i in range(len(alpha)) for j in range(len(alpha)) if
-                    i > j]
-        triplets = sorted(triplets, key=lambda t: t[2])
-        order = [(t[0], t[1]) for t in triplets]
-
-        def _pairwise_ratio(x: np.ndarray, metadata: dict):
-            new_x = []
-            for i, j in order:
-                new_x.append((x[:,i]+1)/(x[:,j]+1))
-            return np.array(new_x).T
-        return _pairwise_ratio
-
-    def poly_decay(self, k: float, p: float, name='poly_decay'):
-        self._states[name] = 0  # time
-
-        def _poly_decay(x: np.ndarray,  metadata: dict):
-            decayed = []
-            for val in x:
-                time = self._states[name]
-                self._states[name] += 1/metadata['f']
-                decayed.append(val * (1 - 1/((time/k)**(2*p)+1)))
-            return np.array(decayed)
-        return _poly_decay
-
-    def process(self, x: np.ndarray, metadata: dict):  # Generator state machine
-        for pipeline_function in self._pipeline:
-            x = pipeline_function(x, metadata)
         return x
 
+    def process(self, x: np.ndarray) -> np.ndarray:  # Generator state machine
+        return self._processing_function(x)
 
-if __name__ == '__main__':
+    def _process(self, x: np.ndarray) -> np.ndarray:
+        for pipeline_function in self._pipeline:
+            x = pipeline_function.compute(x)
+        return x
 
-    print("Initializing test...")
-    # Test reading pipeline success
-    p0 = Pipeline(Path("pipeline/model_p_best.pipeline"))
-    print("Success building pipeline p...")
-    p1 = Pipeline(Path("pipeline/model_s_best.pipeline"))
-    print("Success building pipeline s...")
+    def _init(self, x: np.ndarray) -> np.ndarray:
+        # Get the latest warmup x
+        init: List[bytes] = pickle.loads(self._redis_client.get(self._name + "~init"))
+        init_len: int = int(self._redis_client.get(self._name + "~init_len"))
 
-    # Testing pipeline
-    p = Pipeline(Path("pipeline/test.pipeline"))
-    x = np.array([[1.0, 2.0, 0.0],
-                  [1.0, 0.0, 0.0],
-                  [1.0, 3.0, 0.0],
-                  [1.0, 0.0, 0.0]])
-    metadata = {'f': 20.0}
-    print(f"Initial x:\n{x}\n")
+        # Update state
+        init.append(x.dumps())
+        init_len += len(x)
 
-    # Generate function
-    convert_to_velocity = p.convert_to_velocity("1")
-    exponential_smoothing = p.exponential_smoothing(0.5, "2")
-    multi_exponential_smoothing = p.multi_exponential_smoothing(np.array([0.0, 0.5, 1.0]), "3")
-    square = p.square("4")
-    add_channels = p.add_channels("5")
-    pairwise_ratio = p.pairwise_ratio(np.array([0.0, 0.5, 1.0]), "6")
-    poly_decay = p.poly_decay(1, 1, "7")
+        # Case if not enough data to perform inference
+        if init_len < self.warmup_duration:
+            raise PipelineHasNotBeenInitializedException
 
-    # test functions
-    print(f"convert_to_velocity:\n{convert_to_velocity(x, metadata)}\n")
-    print(f"exponential_smothing:\n{exponential_smoothing(x, metadata)}\n")
-    print(f"multi_exponential_smoothing:\n{multi_exponential_smoothing(np.array([[1.0] for i in range(100)]), metadata)}\n")
-    print(f"square:\n{square(x, metadata)}\n")
-    print(f"add_channels:\n{add_channels(x, metadata)}\n")
-    print(f"pairwise_ratio:\n{pairwise_ratio(x, metadata)}\n")
-    print(f"poly_decay:\n{poly_decay(np.array([[1.0, 1.0] for i in range(10)]), metadata)}\n")
+        # When there are enough data, end initialization state
+        init_np: List[np.ndarray] = [pickle.loads(b) for b in init]
+        x = np.concatenate(init_np, axis=0)
+        x = self._build_pipeline(x)
+        self._processing_function = self._process
+
+        return x
+
+        # Save state
+        self._redis_client.set(self._name + "~init", pickle.dumps(init))
+        self._redis_client.set(self._name + "~init_len", init_len)
+
+        raise
 
 
-
+class PipelineHasNotBeenInitializedException(Exception):
+    pass
